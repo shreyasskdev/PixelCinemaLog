@@ -1,0 +1,200 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Binding 0: Input 16-bit RAW Bayer or 10-bit P010 Luma/Chroma plane from AHardwareBuffer
+layout(binding = 0, r16ui) uniform readonly uimage2D uRawSensorInput;
+
+// Binding 1: Clean 10-bit RGB10_A2 stream sent straight to MediaCodec (HEVC Main10)
+layout(binding = 1, rgb10_a2) uniform writeonly image2D uEncoderOutput;
+
+// Binding 2: Viewfinder preview swapchain (With Monitoring LUT, False Color, or Zebras)
+layout(binding = 2, rgb10_a2) uniform writeonly image2D uPreviewOutput;
+
+layout(push_constant) uniform FrameParams {
+    vec4 blackLevel;
+    float whiteLevel;
+    int transferMode;     // 0=Normal, 1=NoPost_Gamma22, 2=SLog3, 3=ARRILogC4, 4=ACEScct, 5=CanonLog3, 6=AppleLog
+    int previewAssist;    // 0=Flat Log, 1=Rec709 Monitor LUT, 2=False Color IRE, 3=Zebra 95%
+    float exposureCompEV; // Digital exposure push/pull in stops (-2.0 to +2.0 EV)
+    float zoomScale;      // Sub-pixel Vulkan Compute Shader Zoom factor (1.0 .. 10.0)
+    vec4 wbGains;
+    mat3 sensorToRec2020;
+} pc;
+
+// --- 1. Sony S-Log3 (10-bit) ---
+vec3 linearToSLog3(vec3 lin) {
+    vec3 outLog;
+    for (int i = 0; i < 3; i++) {
+        float x = max(0.0, lin[i]);
+        if (x >= 0.01125000) {
+            outLog[i] = (420.0 + (log(x + 0.01) / log(10.0) - log(0.19) / log(10.0)) * 261.5) / 1023.0;
+        } else {
+            outLog[i] = (x * (171.2102946929 - 95.0) / 0.01125000 + 95.0) / 1023.0;
+        }
+    }
+    return clamp(outLog, 0.0, 1.0);
+}
+
+// --- 2. ARRI LogC4 (ALEXA 35) ---
+vec3 linearToArriLogC4(vec3 lin) {
+    const float a = 2231.826309067688;
+    const float b = 0.9071358748778104;
+    const float c = 0.0928641251221896;
+    const float s = -0.000441625069324259;
+    const float t = -0.0180569961199113;
+    vec3 outLog;
+    for (int i = 0; i < 3; i++) {
+        float x = max(t, lin[i]);
+        if (x >= t) {
+            outLog[i] = (log2(a * x + 64.0) - 6.0) / 14.0 * b + c;
+        } else {
+            outLog[i] = (x - t) / s;
+        }
+    }
+    return clamp(outLog, 0.0, 1.0);
+}
+
+// --- 3. ACEScct (Academy Log with Toe) ---
+vec3 linearToACEScct(vec3 lin) {
+    vec3 outLog;
+    for (int i = 0; i < 3; i++) {
+        float x = max(0.0, lin[i]);
+        if (x <= 0.0078125) {
+            outLog[i] = 10.5402377416545 * x + 0.0729055341958355;
+        } else {
+            outLog[i] = (log2(x) + 9.72) / 17.52;
+        }
+    }
+    return clamp(outLog, 0.0, 1.0);
+}
+
+// --- 4. Canon Log 3 (C-Log3) ---
+vec3 linearToCanonLog3(vec3 lin) {
+    vec3 outLog;
+    for (int i = 0; i < 3; i++) {
+        float x = lin[i];
+        if (x < -0.014) {
+            outLog[i] = -0.36726845 * (log(1.0 - 14.98325 * x) / log(10.0)) + 0.12783901;
+        } else if (x <= 0.014) {
+            outLog[i] = 1.9754798 * x + 0.12512219;
+        } else {
+            outLog[i] = 0.36726845 * (log(14.98325 * x + 1.0) / log(10.0)) + 0.12240537;
+        }
+    }
+    return clamp(outLog, 0.0, 1.0);
+}
+
+// --- 5. Apple Log (iPhone Pro Log) ---
+vec3 linearToAppleLog(vec3 lin) {
+    const float r0 = -0.05641088;
+    const float rt = 0.01;
+    const float c = 47.28711236;
+    const float beta = 0.00964052;
+    const float gamma = 0.08550479;
+    const float delta = 0.69336945;
+    vec3 outLog;
+    for (int i = 0; i < 3; i++) {
+        float r = lin[i];
+        if (r < r0) {
+            outLog[i] = 0.0;
+        } else if (r < rt) {
+            float diff = r - r0;
+            outLog[i] = c * diff * diff;
+        } else {
+            outLog[i] = gamma * log2(r + beta) + delta;
+        }
+    }
+    return clamp(outLog, 0.0, 1.0);
+}
+
+vec3 applyFalseColor(vec3 encodedSignal) {
+    float ire = dot(encodedSignal, vec3(0.2126, 0.7152, 0.0722)) * 100.0;
+    if (ire >= 95.0) return vec3(1.0, 0.0, 0.0);
+    if (ire >= 85.0) return vec3(1.0, 1.0, 0.0);
+    if (ire >= 52.0 && ire <= 58.0) return vec3(1.0, 0.5, 0.5);
+    if (ire >= 38.0 && ire <= 44.0) return vec3(0.0, 0.8, 0.2);
+    if (ire <= 4.0)  return vec3(0.5, 0.0, 0.8);
+    return vec3(ire / 100.0);
+}
+
+float fetchBayer(ivec2 coord, ivec2 size) {
+    ivec2 c = clamp(coord, ivec2(0), size - ivec2(1));
+    uint rawVal = imageLoad(uRawSensorInput, c).r;
+    int phase = ((c.y & 1) << 1) | (c.x & 1);
+    float bl = pc.blackLevel[phase];
+    return max(0.0, float(rawVal) - bl) / max(1.0, pc.whiteLevel - bl) * pc.wbGains[phase];
+}
+
+// Samples a 2x2 Bayer Quad at integer quad coordinate `qPos`
+vec3 sampleBayerQuad(ivec2 qPos, ivec2 size) {
+    ivec2 base = qPos * 2;
+    float r  = fetchBayer(base + ivec2(0, 0), size);
+    float g1 = fetchBayer(base + ivec2(1, 0), size);
+    float g2 = fetchBayer(base + ivec2(0, 1), size);
+    float b  = fetchBayer(base + ivec2(1, 1), size);
+    return vec3(r, 0.5 * (g1 + g2), b);
+}
+
+void main() {
+    ivec2 rawSize = imageSize(uRawSensorInput);
+    ivec2 outSize = imageSize(uEncoderOutput);
+    ivec2 gPos = ivec2(gl_GlobalInvocationID.xy);
+    if (gPos.x >= outSize.x || gPos.y >= outSize.y) return;
+
+    // Sub-pixel floating-point center zoom in normalized UV space [0.0 .. 1.0]
+    vec2 normUv = (vec2(gPos) + vec2(0.5)) / vec2(outSize);
+    float z = max(1.0, pc.zoomScale);
+    vec2 zoomedUv = (normUv - vec2(0.5)) / z + vec2(0.5);
+
+    // 2D Bilinear Sub-Pixel Interpolation across 4 neighboring 2x2 Bayer Quads
+    vec2 quadSize = vec2(rawSize / 2 - ivec2(2));
+    vec2 qCoord = clamp(zoomedUv * quadSize, vec2(0.0), quadSize - vec2(1.001));
+    ivec2 q0 = ivec2(floor(qCoord));
+    vec2 frac = fract(qCoord);
+
+    vec3 c00 = sampleBayerQuad(q0 + ivec2(0, 0), rawSize);
+    vec3 c10 = sampleBayerQuad(q0 + ivec2(1, 0), rawSize);
+    vec3 c01 = sampleBayerQuad(q0 + ivec2(0, 1), rawSize);
+    vec3 c11 = sampleBayerQuad(q0 + ivec2(1, 1), rawSize);
+
+    vec3 camRgb = mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
+    vec3 rec2020Linear = (pc.sensorToRec2020 * camRgb) * exp2(pc.exposureCompEV);
+
+    vec3 encodedOut;
+    if (pc.transferMode == 2) {
+        encodedOut = linearToSLog3(rec2020Linear);
+    } else if (pc.transferMode == 3) {
+        encodedOut = linearToArriLogC4(rec2020Linear);
+    } else if (pc.transferMode == 4) {
+        encodedOut = linearToACEScct(rec2020Linear);
+    } else if (pc.transferMode == 5) {
+        encodedOut = linearToCanonLog3(rec2020Linear);
+    } else if (pc.transferMode == 6) {
+        encodedOut = linearToAppleLog(rec2020Linear);
+    } else if (pc.transferMode == 1) {
+        encodedOut = pow(clamp(rec2020Linear, 0.0, 1.0), vec3(1.0 / 2.2));
+    } else {
+        vec3 m = clamp(rec2020Linear, 0.0, 1.0);
+        encodedOut = clamp((m * (2.51 * m + 0.03)) / (m * (2.43 * m + 0.59) + 0.14), 0.0, 1.0);
+        encodedOut = pow(encodedOut, vec3(1.0 / 2.2));
+    }
+
+    // 1. Write sub-pixel zoomed 10-bit Log frame to MediaCodec Encoder!
+    imageStore(uEncoderOutput, gPos, vec4(encodedOut, 1.0));
+
+    // 2. Write Viewfinder Preview (with LUT, False Color, or 95% Zebras)
+    vec3 previewColor = encodedOut;
+    if (pc.previewAssist == 1 && pc.transferMode >= 2) {
+        vec3 mapped = rec2020Linear / (rec2020Linear + vec3(0.18));
+        previewColor = pow(clamp(mapped, 0.0, 1.0), vec3(1.0 / 2.2));
+    } else if (pc.previewAssist == 2) {
+        previewColor = applyFalseColor(encodedOut);
+    } else if (pc.previewAssist == 3) {
+        float luma = dot(encodedOut, vec3(0.2126, 0.7152, 0.0722));
+        if (luma >= 0.95 && ((gPos.x + gPos.y) / 8) % 2 == 0) {
+            previewColor = vec3(1.0, 0.0, 0.0);
+        }
+    }
+    imageStore(uPreviewOutput, gPos, vec4(previewColor, 1.0));
+}

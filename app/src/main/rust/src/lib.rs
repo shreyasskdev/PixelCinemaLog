@@ -2,7 +2,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use jni::{
     objects::{JClass, JFloatArray, JObject, JString},
-    sys::{jfloat, jfloatArray, jint, jobject},
+    sys::{jboolean, jfloat, jfloatArray, jint, jobject},
     JNIEnv,
 };
 use log::info;
@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::{
-    atomic::{AtomicI32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex, OnceLock, RwLock,
 };
 use std::time::Instant;
@@ -34,9 +34,7 @@ unsafe impl Sync for SafeNativeWindow {}
 impl Drop for SafeNativeWindow {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            unsafe {
-                ndk_sys::ANativeWindow_release(self.0);
-            }
+            unsafe { ndk_sys::ANativeWindow_release(self.0); }
         }
     }
 }
@@ -55,16 +53,105 @@ pub struct FrameParamsPushConstants {
     pub sensor_to_rec2020_col2: [f32; 4],
 }
 
-/// High-Precision Native Rust Cinema Power-Zoom Servo
-/// Uses a 7th-Order C3-Continuous Minimum-Snap Spline (Velocity, Acceleration, AND Jerk = 0 at endpoints!)
+// ─────────────────────────────────────────────────────────────────────────────
+// Zoom easing modes — includes a fully custom cubic-bezier variant
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub enum ZoomEasing {
+    Cosine,
+    EaseInOutCubic,
+    Smootherstep,
+    EaseInOutQuint,
+    CustomBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
+}
+
+impl ZoomEasing {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => Self::Cosine,
+            2 => Self::Smootherstep,
+            3 => Self::EaseInOutQuint,
+            4 => Self::CustomBezier { x1: 0.25, y1: 0.10, x2: 0.25, y2: 1.0 },
+            _ => Self::EaseInOutCubic,
+        }
+    }
+
+    #[inline(always)]
+    pub fn apply(&self, t: f64) -> f64 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Cosine => 0.5 - 0.5 * (std::f64::consts::PI * t).cos(),
+            Self::EaseInOutCubic => {
+                if t < 0.5 {
+                    4.0 * t * t * t
+                } else {
+                    let f = -2.0 * t + 2.0;
+                    1.0 - (f * f * f) / 2.0
+                }
+            }
+            Self::Smootherstep => t * t * t * (t * (t * 6.0 - 15.0) + 10.0),
+            Self::EaseInOutQuint => {
+                if t < 0.5 {
+                    16.0 * t.powi(5)
+                } else {
+                    let f = -2.0 * t + 2.0;
+                    1.0 - f.powi(5) / 2.0
+                }
+            }
+            Self::CustomBezier { x1, y1, x2, y2 } => bezier_y_for_x(t, *x1, *y1, *x2, *y2),
+        }
+    }
+}
+
+// ── Cubic-bezier math (CSS / iOS compatible) ────────────────────────────────
+// P(t) = 3(1-t)^2 t * C1 + 3(1-t) t^2 * C2 + t^3    with P0=(0,0), P3=(1,1)
+
+#[inline(always)]
+fn bezier_coord(t: f64, c1: f64, c2: f64) -> f64 {
+    let mt = 1.0 - t;
+    3.0 * mt * mt * t * c1 + 3.0 * mt * t * t * c2 + t * t * t
+}
+
+#[inline(always)]
+fn bezier_derivative(t: f64, c1: f64, c2: f64) -> f64 {
+    let mt = 1.0 - t;
+    3.0 * mt * mt * c1 + 6.0 * mt * t * (c2 - c1) + 3.0 * t * t * (1.0 - c2)
+}
+
+/// Solve y for a given x (time) using Newton-Raphson. Fast + accurate.
+fn bezier_y_for_x(x: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    if x <= 0.0 { return 0.0; }
+    if x >= 1.0 { return 1.0; }
+    if (x1 - y1).abs() < 1e-9 && (x2 - y2).abs() < 1e-9 { return x; }
+
+    let mut t = x;
+    for _ in 0..12 {
+        let err = bezier_coord(t, x1, x2) - x;
+        if err.abs() < 1e-7 { break; }
+        let d = bezier_derivative(t, x1, x2);
+        if d.abs() < 1e-7 { break; }
+        t = (t - err / d).clamp(0.0, 1.0);
+    }
+    bezier_coord(t, y1, y2)
+}
+
+/// High-Precision Native Rust Cinema Power-Zoom Servo.
+/// Stepped exclusively by the dedicated `ZoomServo240Hz` thread.
 pub struct CinemaZoomServo {
     pub start_zoom: f64,
     pub target_zoom: f64,
     pub current_zoom: f64,
-    pub last_emitted_zoom: f64,
     pub start_instant: Instant,
     pub duration_secs: f64,
     pub is_animating: bool,
+    pub easing: ZoomEasing,
+
+    // ── NEW ── Duration control
+    /// If > 0, overrides the auto-computed duration entirely (seconds).
+    pub duration_override_secs: f64,
+    /// Multiplier on the auto-computed duration (only used when override == 0).
+    pub duration_scale: f64,
 }
 
 impl CinemaZoomServo {
@@ -73,11 +160,26 @@ impl CinemaZoomServo {
             start_zoom: 1.0,
             target_zoom: 1.0,
             current_zoom: 1.0,
-            last_emitted_zoom: 1.0,
             start_instant: Instant::now(),
             duration_secs: 0.0,
             is_animating: false,
+            easing: ZoomEasing::EaseInOutCubic,
+            duration_override_secs: 0.0,   // 0 = auto
+            duration_scale: 1.0,           // 1.0 = default speed
         }
+    }
+
+    pub fn set_easing(&mut self, mode: i32) {
+        self.easing = ZoomEasing::from_i32(mode);
+    }
+
+    pub fn set_custom_bezier(&mut self, x1: f64, y1: f64, x2: f64, y2: f64) {
+        self.easing = ZoomEasing::CustomBezier {
+            x1: x1.clamp(0.0, 1.0),
+            y1: y1.clamp(0.0, 1.0),
+            x2: x2.clamp(0.0, 1.0),
+            y2: y2.clamp(0.0, 1.0),
+        };
     }
 
     pub fn set_target(&mut self, target: f64) {
@@ -92,15 +194,36 @@ impl CinemaZoomServo {
         self.target_zoom = clamped_target;
 
         let octaves = (self.target_zoom / self.start_zoom).log2().abs();
-        // Smooth iOS timing: ~0.55s for 1x->2x, ~1.35s for 0.5x->5x
-        self.duration_secs = (0.32 + octaves * 0.30).clamp(0.48, 1.55);
+        let auto_duration = (0.30 + octaves * 0.28).clamp(0.42, 1.45);
+
+        // ── CHANGED ── Honour user override, else scale the auto value.
+        self.duration_secs = if self.duration_override_secs > 0.0 {
+            self.duration_override_secs.clamp(0.10, 5.00)
+        } else {
+            (auto_duration * self.duration_scale.clamp(0.10, 5.00)).clamp(0.10, 5.00)
+        };
+
         self.start_instant = Instant::now();
         self.is_animating = true;
     }
 
-    /// Pure Cosine Ease-In-Out with Velvet Landing:
-    /// Avoids the high midpoint velocity spike of high-order polynomials so crossing
-    /// optical lens boundaries (1x / 5x) is calm, linear-feeling, and seamless!
+    pub fn hard_reset(&mut self, zoom: f64) {
+        let z = zoom.clamp(0.5, 10.0);
+        self.start_zoom = z;
+        self.target_zoom = z;
+        self.current_zoom = z;
+        self.duration_secs = 0.0;
+        self.is_animating = false;
+    }
+
+    pub fn snapshot(&mut self) {
+        self.start_zoom = self.current_zoom;
+        self.target_zoom = self.current_zoom;
+        self.duration_secs = 0.0;
+        self.is_animating = false;
+    }
+
+    #[inline(always)]
     pub fn step(&mut self) -> (f32, bool) {
         if !self.is_animating {
             return (self.current_zoom as f32, false);
@@ -110,19 +233,13 @@ impl CinemaZoomServo {
 
         if t >= 1.0 {
             self.current_zoom = self.target_zoom;
-            self.last_emitted_zoom = self.target_zoom;
             self.is_animating = false;
             return (self.current_zoom as f32, false);
         }
 
-        // Gentle time warp (t^0.88) + Cosine S-Curve:
-        // Starts smoothly, cruises at a controlled speed through lens switches, and feathers to a stop
-        let warped_t = t.powf(0.88);
-        let eased = 0.5 - 0.5 * (std::f64::consts::PI * warped_t).cos();
-
+        let eased = self.easing.apply(t);
+        // Log-space interpolation: equal octaves take equal time.
         self.current_zoom = self.start_zoom * (self.target_zoom / self.start_zoom).powf(eased);
-        self.last_emitted_zoom = self.current_zoom;
-
         (self.current_zoom as f32, true)
     }
 }
@@ -134,6 +251,8 @@ pub struct SharedCameraState {
     pub raw_frame_counter: AtomicU64,
     pub raw_dump_fd: AtomicI32,
     pub zoom_servo: Mutex<CinemaZoomServo>,
+    pub current_zoom: AtomicU32,
+    pub zoom_animating: AtomicBool,
     pub latest_metadata: RwLock<FrameParamsPushConstants>,
     pub latest_histogram: Mutex<[f32; 64]>,
     pub preview_window: Mutex<Option<SafeNativeWindow>>,
@@ -148,18 +267,16 @@ fn get_state() -> &'static Arc<SharedCameraState> {
             android_logger::Config::default().with_max_level(log::LevelFilter::Info),
         );
         info!("Rust PixelCinemaLog Engine Initialized!");
-        info!(
-            "Loaded compiled Vulkan Compute Shader (cinema_pipeline.spv): {} bytes",
-            CINEMA_SHADER_SPV.len()
-        );
 
-        Arc::new(SharedCameraState {
+        let state = Arc::new(SharedCameraState {
             transfer_mode: AtomicI32::new(2),
             preview_assist: AtomicI32::new(0),
             cfa_pattern: AtomicI32::new(0),
             raw_frame_counter: AtomicU64::new(0),
             raw_dump_fd: AtomicI32::new(-1),
             zoom_servo: Mutex::new(CinemaZoomServo::new()),
+            current_zoom: AtomicU32::new(1.0f32.to_bits()),
+            zoom_animating: AtomicBool::new(false),
             latest_metadata: RwLock::new(FrameParamsPushConstants {
                 black_level: [64.0, 64.0, 64.0, 64.0],
                 white_level: 1023.0,
@@ -174,7 +291,23 @@ fn get_state() -> &'static Arc<SharedCameraState> {
             latest_histogram: Mutex::new([0.0; 64]),
             preview_window: Mutex::new(None),
             record_window: Mutex::new(None),
-        })
+        });
+
+        // ── 240 Hz servo thread — the ONLY place the servo is stepped ──
+        let servo_state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("ZoomServo240Hz".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_micros(4_166));
+                if let Ok(mut servo) = servo_state.zoom_servo.lock() {
+                    let (z, animating) = servo.step();
+                    servo_state.current_zoom.store(z.to_bits(), Ordering::Release);
+                    servo_state.zoom_animating.store(animating, Ordering::Release);
+                }
+            })
+            .expect("Failed to spawn ZoomServo240Hz thread");
+
+        state
     })
 }
 
@@ -183,7 +316,6 @@ fn pack_raw16_to_lossless_12bit(raw_bytes: &[u8], w: usize, h: usize, stride_byt
     let mut packed = Vec::with_capacity((total_pixels * 3) / 2);
     let src_u16 = unsafe { std::slice::from_raw_parts(raw_bytes.as_ptr() as *const u16, raw_bytes.len() / 2) };
     let stride_u16 = stride_bytes / 2;
-
     for y in 0..h {
         let row = &src_u16[y * stride_u16 .. y * stride_u16 + w];
         let mut x = 0;
@@ -206,10 +338,8 @@ fn unpack_lossless_12bit_to_raw16(packed: &[u8], w: usize, h: usize) -> Vec<u8> 
         let b0 = packed[i] as u16;
         let b1 = packed[i + 1] as u16;
         let b2 = packed[i + 2] as u16;
-
         let p0: u16 = b0 | ((b1 & 0x0F) << 8);
         let p1: u16 = (b1 >> 4) | (b2 << 4);
-
         out_u8.extend_from_slice(&p0.to_le_bytes());
         out_u8.extend_from_slice(&p1.to_le_bytes());
         i += 3;
@@ -233,20 +363,12 @@ fn linear_to_arri_logc4(x: f32) -> f32 {
     let c = 0.092864125_f32;
     let s = -0.000441625_f32;
     let t = -0.018056996_f32;
-    if x >= t {
-        ((a * x + 64.0).log2() - 6.0) / 14.0 * b + c
-    } else {
-        (x - t) / s
-    }
+    if x >= t { ((a * x + 64.0).log2() - 6.0) / 14.0 * b + c } else { (x - t) / s }
 }
 
 #[inline(always)]
 fn linear_to_aces_cct(x: f32) -> f32 {
-    if x <= 0.0078125 {
-        10.5402377 * x + 0.072905534
-    } else {
-        (x.log2() + 9.72) / 17.52
-    }
+    if x <= 0.0078125 { 10.5402377 * x + 0.072905534 } else { (x.log2() + 9.72) / 17.52 }
 }
 
 #[inline(always)]
@@ -268,13 +390,9 @@ fn linear_to_apple_log(r: f32) -> f32 {
     let beta = 0.00964052_f32;
     let gamma = 0.08550479_f32;
     let delta = 0.69336945_f32;
-    if r < r0 {
-        0.0
-    } else if r < rt {
-        c * (r - r0).powi(2)
-    } else {
-        gamma * (r + beta).log2() + delta
-    }
+    if r < r0 { 0.0 }
+    else if r < rt { c * (r - r0).powi(2) }
+    else { gamma * (r + beta).log2() + delta }
 }
 
 #[inline(always)]
@@ -316,7 +434,6 @@ unsafe fn sample_bayer_quad(
     let p01 = (*row0.add(bx + 1) as i32 - bl).max(0) as f32;
     let p10 = (*row1.add(bx) as i32 - bl).max(0) as f32;
     let p11 = (*row1.add(bx + 1) as i32 - bl).max(0) as f32;
-
     match cfa {
         1 => (p01, 0.5 * (p00 + p11), p10),
         2 => (p10, 0.5 * (p00 + p11), p01),
@@ -325,8 +442,6 @@ unsafe fn sample_bayer_quad(
     }
 }
 
-/// Renders an unprocessed 16-bit Bayer `RAW_SENSOR` frame with TRUE 2D Bilinear Sub-Pixel
-/// Interpolation so zooming in RAW16 mode has zero integer pixel stepping!
 unsafe fn blit_raw16_to_window(
     window_ptr: *mut ndk_sys::ANativeWindow,
     raw_bytes: *const u8,
@@ -340,19 +455,13 @@ unsafe fn blit_raw16_to_window(
     zoom_factor: f32,
     mut hist_out: Option<&mut [f32; 64]>,
 ) {
-    if window_ptr.is_null() || raw_bytes.is_null() {
-        return;
-    }
-
+    if window_ptr.is_null() || raw_bytes.is_null() { return; }
     let out_w = (raw_width / 2).min(1920);
     let out_h = (raw_height / 2).min(1080);
 
     let _ = ndk_sys::ANativeWindow_setBuffersGeometry(window_ptr, out_w, out_h, 1);
-
     let mut buffer: ndk_sys::ANativeWindow_Buffer = std::mem::zeroed();
-    if ndk_sys::ANativeWindow_lock(window_ptr, &mut buffer, std::ptr::null_mut()) != 0 {
-        return;
-    }
+    if ndk_sys::ANativeWindow_lock(window_ptr, &mut buffer, std::ptr::null_mut()) != 0 { return; }
 
     let dst_ptr = buffer.bits as *mut u32;
     let dst_stride = buffer.stride as usize;
@@ -368,7 +477,6 @@ unsafe fn blit_raw16_to_window(
     let max_y = (buffer.height as usize).min(out_h as usize);
     let max_x = (buffer.width as usize).min(out_w as usize);
 
-    // Work in 2x2 Bayer super-pixel coordinates (0 .. quad_w, 0 .. quad_h)
     let quad_w = (raw_width as usize / 2).saturating_sub(2) as f32;
     let quad_h = (raw_height as usize / 2).saturating_sub(2) as f32;
     let z = zoom_factor.max(1.0);
@@ -385,9 +493,7 @@ unsafe fn blit_raw16_to_window(
         let fy = qy_f - (qy0 as f32);
         let by0 = qy0 * 2;
         let by1 = (qy0 + 1) * 2;
-        if by1 + 1 >= raw_height as usize {
-            continue;
-        }
+        if by1 + 1 >= raw_height as usize { continue; }
         let dst_row = dst_ptr.add(y * dst_stride);
 
         for x in 0..max_x {
@@ -396,11 +502,8 @@ unsafe fn blit_raw16_to_window(
             let fx = qx_f - (qx0 as f32);
             let bx0 = qx0 * 2;
             let bx1 = (qx0 + 1) * 2;
-            if bx1 + 1 >= raw_width as usize {
-                continue;
-            }
+            if bx1 + 1 >= raw_width as usize { continue; }
 
-            // Bilinear sub-pixel interpolation across 4 neighboring Bayer quads
             let c00 = sample_bayer_quad(src_u16, src_stride_u16, bx0, by0, bl, cfa);
             let c10 = sample_bayer_quad(src_u16, src_stride_u16, bx1, by0, bl, cfa);
             let c01 = sample_bayer_quad(src_u16, src_stride_u16, bx0, by1, bl, cfa);
@@ -434,24 +537,15 @@ unsafe fn blit_raw16_to_window(
                 b = (linear_to_rec709(idx_b as f32 / 4095.0) * 255.0) as u8;
             } else if apply_assist == 2 {
                 let ire = ((r as u32 * 21 + g as u32 * 72 + b as u32 * 7) / 255) as u8;
-                if ire >= 95 {
-                    r = 255; g = 0; b = 0;
-                } else if ire >= 85 {
-                    r = 255; g = 255; b = 0;
-                } else if ire >= 52 && ire <= 58 {
-                    r = 255; g = 128; b = 128;
-                } else if ire >= 38 && ire <= 44 {
-                    r = 0; g = 210; b = 50;
-                } else if ire <= 5 {
-                    r = 130; g = 0; b = 210;
-                } else {
-                    r = ire; g = ire; b = ire;
-                }
+                if ire >= 95 { r = 255; g = 0; b = 0; }
+                else if ire >= 85 { r = 255; g = 255; b = 0; }
+                else if ire >= 52 && ire <= 58 { r = 255; g = 128; b = 128; }
+                else if ire >= 38 && ire <= 44 { r = 0; g = 210; b = 50; }
+                else if ire <= 5 { r = 130; g = 0; b = 210; }
+                else { r = ire; g = ire; b = ire; }
             } else if apply_assist == 3 {
                 let ire = ((r as u32 * 21 + g as u32 * 72 + b as u32 * 7) / 255) as u8;
-                if ire >= 95 && ((x + y) / 6) % 2 == 0 {
-                    r = 255; g = 0; b = 0;
-                }
+                if ire >= 95 && ((x + y) / 6) % 2 == 0 { r = 255; g = 0; b = 0; }
             }
 
             *dst_row.add(x) = 0xFF00_0000 | ((b as u32) << 16) | ((g as u32) << 8) | (r as u32);
@@ -469,30 +563,22 @@ unsafe fn blit_raw16_to_window(
 }
 
 fn write_cinema_dng_frame(
-    out_path: &str,
-    w: u32,
-    h: u32,
-    stride: u32,
-    white_level: f32,
-    cfa: i32,
-    raw_bytes: &[u8],
+    out_path: &str, w: u32, h: u32, stride: u32,
+    white_level: f32, cfa: i32, raw_bytes: &[u8],
 ) -> std::io::Result<()> {
     let mut f = File::create(out_path)?;
-
     let cfa_bytes: [u8; 4] = match cfa {
         1 => [1, 0, 2, 1],
         2 => [1, 2, 0, 1],
         3 => [2, 1, 1, 0],
         _ => [0, 1, 1, 2],
     };
-
     let num_entries: u16 = 16;
     let ifd_offset: u32 = 8;
     let pixel_data_offset: u32 = 256;
     let strip_byte_count: u32 = w * h * 2;
 
     let mut hdr = Vec::with_capacity(pixel_data_offset as usize);
-
     hdr.extend_from_slice(b"II");
     hdr.extend_from_slice(&42u16.to_le_bytes());
     hdr.extend_from_slice(&ifd_offset.to_le_bytes());
@@ -534,21 +620,15 @@ fn write_cinema_dng_frame(
         for y in 0..(h as usize) {
             let start = y * stride_usize;
             let end = start + row_bytes;
-            if end <= raw_bytes.len() {
-                f.write_all(&raw_bytes[start..end])?;
-            }
+            if end <= raw_bytes.len() { f.write_all(&raw_bytes[start..end])?; }
         }
     }
-
     Ok(())
 }
 
 fn read_raw_frame_payload(
-    file: &mut File,
-    hdr: &[u8; 24],
-    w: usize,
-    h: usize,
-    stride_or_packed_len: usize,
+    file: &mut File, hdr: &[u8; 24],
+    w: usize, h: usize, stride_or_packed_len: usize,
 ) -> std::io::Result<(Vec<u8>, i32)> {
     if &hdr[0..4] == b"RAWZ" {
         let mut packed = vec![0u8; stride_or_packed_len];
@@ -563,44 +643,154 @@ fn read_raw_frame_payload(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JNI entry points
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_initEngine(
-    _env: JNIEnv,
-    _class: JClass,
+    _env: JNIEnv, _class: JClass,
 ) {
     let _ = get_state();
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomTarget(
-    _env: JNIEnv,
-    _class: JClass,
-    target_zoom: jfloat,
+    _env: JNIEnv, _class: JClass, target_zoom: jfloat,
+) {
+    let state = get_state();
+    if let Ok(mut servo) = state.zoom_servo.lock() {
+        servo.set_target(target_zoom as f64);
+        state.current_zoom.store((servo.current_zoom as f32).to_bits(), Ordering::Release);
+        state.zoom_animating.store(servo.is_animating, Ordering::Release);
+    }
+}
+
+/// Set a fixed duration (seconds). Pass <= 0 to restore auto-duration.
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomDurationFixed(
+    _env: JNIEnv, _class: JClass, seconds: jfloat,
 ) {
     if let Ok(mut servo) = get_state().zoom_servo.lock() {
-        servo.set_target(target_zoom as f64);
+        servo.duration_override_secs = if seconds > 0.0 {
+            (seconds as f64).clamp(0.10, 5.00)
+        } else {
+            0.0
+        };
+    }
+}
+
+/// Returns the currently-set fixed duration, or 0.0 if in auto mode.
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getZoomDurationFixed(
+    _env: JNIEnv, _class: JClass,
+) -> jfloat {
+    get_state().zoom_servo.lock()
+        .map(|s| s.duration_override_secs as f32)
+        .unwrap_or(0.0)
+}
+
+/// Multiplier on the auto-computed duration. 0.5 = twice as fast, 2.0 = twice as slow.
+/// Ignored when a fixed duration is set.
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomDurationScale(
+    _env: JNIEnv, _class: JClass, scale: jfloat,
+) {
+    if let Ok(mut servo) = get_state().zoom_servo.lock() {
+        servo.duration_scale = (scale as f64).clamp(0.10, 5.00);
     }
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_stepZoomServo(
-    _env: JNIEnv,
-    _class: JClass,
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getZoomDurationScale(
+    _env: JNIEnv, _class: JClass,
 ) -> jfloat {
-    if let Ok(mut servo) = get_state().zoom_servo.lock() {
-        let (z, active) = servo.step();
-        if active { z } else { -z }
-    } else {
-        -1.0
+    get_state().zoom_servo.lock()
+        .map(|s| s.duration_scale as f32)
+        .unwrap_or(1.0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getCurrentZoom(
+    _env: JNIEnv, _class: JClass,
+) -> jfloat {
+    f32::from_bits(get_state().current_zoom.load(Ordering::Acquire))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_isZoomAnimating(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean {
+    get_state().zoom_animating.load(Ordering::Acquire) as jboolean
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_resetZoomTo(
+    _env: JNIEnv, _class: JClass, zoom: jfloat,
+) {
+    let state = get_state();
+    if let Ok(mut servo) = state.zoom_servo.lock() {
+        servo.hard_reset(zoom as f64);
+        state.current_zoom.store((servo.current_zoom as f32).to_bits(), Ordering::Release);
+        state.zoom_animating.store(false, Ordering::Release);
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_snapshotZoom(
+    _env: JNIEnv, _class: JClass,
+) {
+    let state = get_state();
+    if let Ok(mut servo) = state.zoom_servo.lock() {
+        servo.snapshot();
+        state.current_zoom.store((servo.current_zoom as f32).to_bits(), Ordering::Release);
+        state.zoom_animating.store(false, Ordering::Release);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomEasing(
+    _env: JNIEnv, _class: JClass, mode: i32,
+) {
+    if let Ok(mut servo) = get_state().zoom_servo.lock() {
+        servo.set_easing(mode);
+    }
+}
+
+/// Apply a custom cubic-bezier (x1, y1, x2, y2). Also switches the servo to
+/// CustomBezier mode. All values must be within [0, 1] — they're clamped here too.
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setCustomBezierEasing(
+    _env: JNIEnv, _class: JClass,
+    x1: jfloat, y1: jfloat, x2: jfloat, y2: jfloat,
+) {
+    if let Ok(mut servo) = get_state().zoom_servo.lock() {
+        servo.set_custom_bezier(x1 as f64, y1 as f64, x2 as f64, y2 as f64);
+    }
+}
+
+/// Returns the currently applied bezier as [x1, y1, x2, y2]. If the servo is
+/// not in CustomBezier mode, returns the CSS-default ease-in-out curve.
+#[no_mangle]
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getCustomBezierEasing(
+    env: JNIEnv, _class: JClass,
+) -> jfloatArray {
+    let (x1, y1, x2, y2) = match get_state().zoom_servo.lock() {
+        Ok(servo) => match servo.easing {
+            ZoomEasing::CustomBezier { x1, y1, x2, y2 } =>
+                (x1 as f32, y1 as f32, x2 as f32, y2 as f32),
+            _ => (0.25f32, 0.10f32, 0.25f32, 1.0f32),
+        },
+        Err(_) => (0.25f32, 0.10f32, 0.25f32, 1.0f32),
+    };
+    let out = env.new_float_array(4).expect("bezier array");
+    let _ = env.set_float_array_region(&out, 0, &[x1, y1, x2, y2]);
+    out.into_raw()
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setCameraMode(
-    _env: JNIEnv,
-    _class: JClass,
-    transfer_mode: i32,
-    preview_assist: i32,
+    _env: JNIEnv, _class: JClass, transfer_mode: i32, preview_assist: i32,
 ) {
     let state = get_state();
     state.transfer_mode.store(transfer_mode, Ordering::Relaxed);
@@ -609,251 +799,123 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setRawDumpFd(
-    _env: JNIEnv,
-    _class: JClass,
-    fd: i32,
+    _env: JNIEnv, _class: JClass, fd: i32,
 ) {
-    let state = get_state();
-    state.raw_dump_fd.store(fd, Ordering::SeqCst);
+    get_state().raw_dump_fd.store(fd, Ordering::SeqCst);
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getLiveHistogram(
-    env: JNIEnv,
-    _class: JClass,
+    env: JNIEnv, _class: JClass,
 ) -> jfloatArray {
     let state = get_state();
-    let hist = state
-        .latest_histogram
-        .lock()
-        .map(|h| *h)
-        .unwrap_or([0.0f32; 64]);
-    let out = env
-        .new_float_array(64)
-        .expect("Failed to allocate histogram float array");
+    let hist = state.latest_histogram.lock().map(|h| *h).unwrap_or([0.0f32; 64]);
+    let out = env.new_float_array(64).expect("Failed to allocate histogram float array");
     let _ = env.set_float_array_region(&out, 0, &hist);
     out.into_raw()
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getRaw16FrameCount(
-    mut env: JNIEnv,
-    _class: JClass,
-    file_path: JString,
+    mut env: JNIEnv, _class: JClass, file_path: JString,
 ) -> jint {
-    let path_str: String = match env.get_string(&file_path) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
-    };
-    let mut file = match File::open(&path_str) {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
-    let file_len = match file.metadata() {
-        Ok(m) => m.len(),
-        Err(_) => return 0,
-    };
+    let path_str: String = match env.get_string(&file_path) { Ok(s) => s.into(), Err(_) => return 0 };
+    let mut file = match File::open(&path_str) { Ok(f) => f, Err(_) => return 0 };
+    let file_len = match file.metadata() { Ok(m) => m.len(), Err(_) => return 0 };
     let mut hdr = [0u8; 24];
-    if file.read_exact(&mut hdr).is_err() {
-        return 0;
-    }
+    if file.read_exact(&mut hdr).is_err() { return 0; }
     let h = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
     let stride_or_len = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as u64;
-
-    let frame_bytes = if &hdr[0..4] == b"RAWZ" {
-        24 + stride_or_len
-    } else if &hdr[0..4] == b"RAWF" {
-        24 + (h * stride_or_len)
-    } else {
-        return 0;
-    };
-
-    if frame_bytes == 0 {
-        return 0;
-    }
+    let frame_bytes = if &hdr[0..4] == b"RAWZ" { 24 + stride_or_len }
+        else if &hdr[0..4] == b"RAWF" { 24 + (h * stride_or_len) } else { return 0 };
+    if frame_bytes == 0 { return 0; }
     (file_len / frame_bytes) as jint
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_renderRaw16FrameFromFile(
-    mut env: JNIEnv,
-    _class: JClass,
-    file_path: JString,
-    frame_index: jint,
-    transfer_mode: jint,
-    preview_assist: jint,
-    exposure_ev: f32,
-    surface: JObject,
+    mut env: JNIEnv, _class: JClass,
+    file_path: JString, frame_index: jint,
+    transfer_mode: jint, preview_assist: jint, exposure_ev: f32, surface: JObject,
 ) -> jint {
-    if surface.is_null() {
-        return -1;
-    }
-    let path_str: String = match env.get_string(&file_path) {
-        Ok(s) => s.into(),
-        Err(_) => return -1,
-    };
-    let mut file = match File::open(&path_str) {
-        Ok(f) => f,
-        Err(_) => return -1,
-    };
-
+    if surface.is_null() { return -1; }
+    let path_str: String = match env.get_string(&file_path) { Ok(s) => s.into(), Err(_) => return -1 };
+    let mut file = match File::open(&path_str) { Ok(f) => f, Err(_) => return -1 };
     let mut hdr = [0u8; 24];
-    if file.read_exact(&mut hdr).is_err() {
-        return -1;
-    }
-
+    if file.read_exact(&mut hdr).is_err() { return -1; }
     let w = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
     let h = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
     let stride_or_len = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
     let white_level = f32::from_le_bytes(hdr[16..20].try_into().unwrap());
     let cfa = u32::from_le_bytes(hdr[20..24].try_into().unwrap()) as i32;
-
-    let frame_total_size = if &hdr[0..4] == b"RAWZ" {
-        24 + stride_or_len as u64
-    } else if &hdr[0..4] == b"RAWF" {
-        24 + (h * stride_or_len) as u64
-    } else {
-        return -1;
-    };
-
+    let frame_total_size = if &hdr[0..4] == b"RAWZ" { 24 + stride_or_len as u64 }
+        else if &hdr[0..4] == b"RAWF" { 24 + (h * stride_or_len) as u64 } else { return -1 };
     let target_offset = (frame_index.max(0) as u64) * frame_total_size;
-    if file.seek(SeekFrom::Start(target_offset)).is_err() {
-        return -1;
-    }
-    if file.read_exact(&mut hdr).is_err() {
-        return -1;
-    }
-
+    if file.seek(SeekFrom::Start(target_offset)).is_err() { return -1; }
+    if file.read_exact(&mut hdr).is_err() { return -1; }
     let (raw_buf, actual_stride) = match read_raw_frame_payload(&mut file, &hdr, w, h, stride_or_len) {
-        Ok(res) => res,
-        Err(_) => return -1,
+        Ok(res) => res, Err(_) => return -1,
     };
-
     let ev_gain = 2.0_f32.powf(exposure_ev);
     let lut = build_12bit_log_lut(transfer_mode, ev_gain);
-
     let mut meta: FrameParamsPushConstants = Zeroable::zeroed();
     meta.black_level = [64.0, 64.0, 64.0, 64.0];
     meta.white_level = white_level.max(1023.0);
     meta.wb_gains = [1.95, 1.0, 1.0, 1.65];
-
     let state = get_state();
     let mut hist_local = [0.0f32; 64];
-
     unsafe {
-        let win_ptr =
-            ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw());
+        let win_ptr = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw());
         if !win_ptr.is_null() {
-            blit_raw16_to_window(
-                win_ptr,
-                raw_buf.as_ptr(),
-                w as i32,
-                h as i32,
-                actual_stride,
-                &meta,
-                cfa,
-                &lut,
-                preview_assist,
-                1.0,
-                Some(&mut hist_local),
-            );
+            blit_raw16_to_window(win_ptr, raw_buf.as_ptr(), w as i32, h as i32, actual_stride,
+                &meta, cfa, &lut, preview_assist, 1.0, Some(&mut hist_local));
             ndk_sys::ANativeWindow_release(win_ptr);
         }
     }
-
-    if let Ok(mut h_lock) = state.latest_histogram.lock() {
-        *h_lock = hist_local;
-    }
-
+    if let Ok(mut h_lock) = state.latest_histogram.lock() { *h_lock = hist_local; }
     0
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_exportRaw16ToCinemaDng(
-    mut env: JNIEnv,
-    _class: JClass,
-    raw16_path: JString,
-    out_dir_path: JString,
+    mut env: JNIEnv, _class: JClass, raw16_path: JString, out_dir_path: JString,
 ) -> jint {
-    let in_path: String = match env.get_string(&raw16_path) {
-        Ok(s) => s.into(),
-        Err(_) => return -1,
-    };
-    let out_dir: String = match env.get_string(&out_dir_path) {
-        Ok(s) => s.into(),
-        Err(_) => return -1,
-    };
-
+    let in_path: String = match env.get_string(&raw16_path) { Ok(s) => s.into(), Err(_) => return -1 };
+    let out_dir: String = match env.get_string(&out_dir_path) { Ok(s) => s.into(), Err(_) => return -1 };
     let _ = std::fs::create_dir_all(&out_dir);
-
-    let mut file = match File::open(&in_path) {
-        Ok(f) => f,
-        Err(_) => return -1,
-    };
-
+    let mut file = match File::open(&in_path) { Ok(f) => f, Err(_) => return -1 };
     let mut hdr = [0u8; 24];
     let mut exported_count: i32 = 0;
-
     loop {
-        if file.read_exact(&mut hdr).is_err() {
-            break;
-        }
-        if &hdr[0..4] != b"RAWZ" && &hdr[0..4] != b"RAWF" {
-            break;
-        }
-
+        if file.read_exact(&mut hdr).is_err() { break; }
+        if &hdr[0..4] != b"RAWZ" && &hdr[0..4] != b"RAWF" { break; }
         let w = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
         let h = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
         let stride_or_len = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
         let white_level = f32::from_le_bytes(hdr[16..20].try_into().unwrap());
         let cfa = u32::from_le_bytes(hdr[20..24].try_into().unwrap()) as i32;
-
         let (raw_buf, actual_stride) =
             match read_raw_frame_payload(&mut file, &hdr, w, h, stride_or_len) {
-                Ok(res) => res,
-                Err(_) => break,
+                Ok(res) => res, Err(_) => break,
             };
-
         let dng_filename = format!("{}/frame_{:05}.dng", out_dir, exported_count);
-        if write_cinema_dng_frame(
-            &dng_filename,
-            w as u32,
-            h as u32,
-            actual_stride as u32,
-            white_level,
-            cfa,
-            &raw_buf,
-        )
-        .is_ok()
-        {
-            exported_count += 1;
-        } else {
-            break;
-        }
+        if write_cinema_dng_frame(&dng_filename, w as u32, h as u32, actual_stride as u32,
+            white_level, cfa, &raw_buf).is_ok() { exported_count += 1; } else { break; }
     }
-
-    info!(
-        "Exported {} CinemaDNG (.dng) frames to {}",
-        exported_count, out_dir
-    );
+    info!("Exported {} CinemaDNG (.dng) frames to {}", exported_count, out_dir);
     exported_count
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_generateLogCurve(
-    env: JNIEnv,
-    _class: JClass,
-    transfer_mode: i32,
-    exposure_ev: f32,
+    env: JNIEnv, _class: JClass, transfer_mode: i32, exposure_ev: f32,
 ) -> jfloatArray {
     let points = 64usize;
     let mut curve = Vec::with_capacity(points * 2);
     let ev_gain = 2.0_f32.powf(exposure_ev);
-
     for i in 0..points {
         let x = i as f32 / (points - 1) as f32;
         let scaled_x = (x * ev_gain).max(0.0);
-
         let y = match transfer_mode {
             1 => scaled_x.powf(1.0 / 2.2),
             2 => linear_to_slog3(scaled_x),
@@ -863,41 +925,29 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
             6 => linear_to_apple_log(scaled_x),
             _ => linear_to_slog3(scaled_x),
         };
-
         curve.push(x);
         curve.push(y.clamp(0.0, 1.0));
     }
-
-    let out = env
-        .new_float_array(curve.len() as i32)
-        .expect("Failed to allocate JNI float array");
-    env.set_float_array_region(&out, 0, &curve)
-        .expect("Failed to copy Log curve to JVM");
+    let out = env.new_float_array(curve.len() as i32).expect("Failed to allocate JNI float array");
+    env.set_float_array_region(&out, 0, &curve).expect("Failed to copy Log curve to JVM");
     out.into_raw()
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_updateSensorMetadata(
-    env: JNIEnv,
-    _class: JClass,
-    black_level_arr: JFloatArray,
-    white_level: f32,
-    wb_gains_arr: JFloatArray,
-    ccm_arr: JFloatArray,
-    cfa_pattern: i32,
-    exposure_ev: f32,
+    env: JNIEnv, _class: JClass,
+    black_level_arr: JFloatArray, white_level: f32,
+    wb_gains_arr: JFloatArray, ccm_arr: JFloatArray,
+    cfa_pattern: i32, exposure_ev: f32,
 ) {
     let mut bl = [64.0f32; 4];
     let mut wb = [1.0f32; 4];
     let mut ccm = [0.0f32; 9];
-
     let _ = env.get_float_array_region(&black_level_arr, 0, &mut bl);
     let _ = env.get_float_array_region(&wb_gains_arr, 0, &mut wb);
     let _ = env.get_float_array_region(&ccm_arr, 0, &mut ccm);
-
     let state = get_state();
     state.cfa_pattern.store(cfa_pattern, Ordering::Relaxed);
-
     if let Ok(mut meta) = state.latest_metadata.write() {
         meta.black_level = bl;
         meta.white_level = white_level;
@@ -911,187 +961,101 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setRawOutputSurfaces(
-    env: JNIEnv,
-    _class: JClass,
-    preview_surface: JObject,
-    record_surface: JObject,
+    env: JNIEnv, _class: JClass, preview_surface: JObject, record_surface: JObject,
 ) {
     let state = get_state();
     unsafe {
         if let Ok(mut pw) = state.preview_window.lock() {
             *pw = if !preview_surface.is_null() {
-                let ptr = ndk_sys::ANativeWindow_fromSurface(
-                    env.get_native_interface(),
-                    preview_surface.as_raw(),
-                );
-                if !ptr.is_null() {
-                    Some(SafeNativeWindow(ptr))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+                let ptr = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), preview_surface.as_raw());
+                if !ptr.is_null() { Some(SafeNativeWindow(ptr)) } else { None }
+            } else { None };
         }
         if let Ok(mut rw) = state.record_window.lock() {
             *rw = if !record_surface.is_null() {
-                let ptr = ndk_sys::ANativeWindow_fromSurface(
-                    env.get_native_interface(),
-                    record_surface.as_raw(),
-                );
-                if !ptr.is_null() {
-                    Some(SafeNativeWindow(ptr))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+                let ptr = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), record_surface.as_raw());
+                if !ptr.is_null() { Some(SafeNativeWindow(ptr)) } else { None }
+            } else { None };
         }
     }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_createRawSensorSurface(
-    env: JNIEnv,
-    _class: JClass,
-    width: i32,
-    height: i32,
+    env: JNIEnv, _class: JClass, width: i32, height: i32,
 ) -> jobject {
     let state = get_state().clone();
-    info!(
-        "Creating Full RAW_SENSOR (RAW16) Zero-ISP Pipeline at {}x{}",
-        width, height
-    );
+    info!("Creating RAW_SENSOR (RAW16) Zero-ISP Pipeline at {}x{}", width, height);
 
     let mut reader = ImageReader::new_with_usage(
-        width,
-        height,
-        ImageFormat::from(32i32),
-        HardwareBufferUsage::CPU_READ_OFTEN | HardwareBufferUsage::GPU_SAMPLED_IMAGE,
-        8,
-    )
-    .expect("Failed to create RAW16 ImageReader");
+        width, height, ImageFormat::from(32i32),
+        HardwareBufferUsage::CPU_READ_OFTEN | HardwareBufferUsage::GPU_SAMPLED_IMAGE, 8,
+    ).expect("Failed to create RAW16 ImageReader");
 
-    reader
-        .set_image_listener(Box::new(move |reader| {
-            let mut latest_img = None;
-            while let Ok(AcquireResult::Image(img)) = reader.acquire_next_image() {
-                latest_img = Some(img);
-            }
+    reader.set_image_listener(Box::new(move |reader| {
+        let mut latest_img = None;
+        while let Ok(AcquireResult::Image(img)) = reader.acquire_next_image() {
+            latest_img = Some(img);
+        }
+        if let Some(image) = latest_img {
+            unsafe {
+                let raw_img_ptr: *mut ndk_sys::AImage = *(&image as *const _ as *const *mut ndk_sys::AImage);
+                let mut w: i32 = width;
+                let mut h: i32 = height;
+                let mut row_stride: i32 = width * 2;
+                let mut data_ptr: *mut u8 = std::ptr::null_mut();
+                let mut data_len: i32 = 0;
+                let _ = ndk_sys::AImage_getWidth(raw_img_ptr, &mut w);
+                let _ = ndk_sys::AImage_getHeight(raw_img_ptr, &mut h);
+                let _ = ndk_sys::AImage_getPlaneRowStride(raw_img_ptr, 0, &mut row_stride);
+                let _ = ndk_sys::AImage_getPlaneData(raw_img_ptr, 0, &mut data_ptr, &mut data_len);
 
-            if let Some(image) = latest_img {
-                unsafe {
-                    let raw_img_ptr: *mut ndk_sys::AImage =
-                        *(&image as *const _ as *const *mut ndk_sys::AImage);
-                    let mut w: i32 = width;
-                    let mut h: i32 = height;
-                    let mut row_stride: i32 = width * 2;
-                    let mut data_ptr: *mut u8 = std::ptr::null_mut();
-                    let mut data_len: i32 = 0;
+                if !data_ptr.is_null() && data_len > 0 {
+                    let meta = state.latest_metadata.read().map(|m| *m).unwrap_or_else(|_| Zeroable::zeroed());
+                    let cfa = state.cfa_pattern.load(Ordering::Relaxed);
+                    let assist = state.preview_assist.load(Ordering::Relaxed);
+                    let ev_gain = 2.0_f32.powf(meta.exposure_comp_ev);
+                    let lut = build_12bit_log_lut(2, ev_gain);
 
-                    let _ = ndk_sys::AImage_getWidth(raw_img_ptr, &mut w);
-                    let _ = ndk_sys::AImage_getHeight(raw_img_ptr, &mut h);
-                    let _ = ndk_sys::AImage_getPlaneRowStride(raw_img_ptr, 0, &mut row_stride);
-                    let _ = ndk_sys::AImage_getPlaneData(
-                        raw_img_ptr,
-                        0,
-                        &mut data_ptr,
-                        &mut data_len,
-                    );
+                    // READ-ONLY: servo is stepped by the 240 Hz Rust thread only.
+                    let current_z = f32::from_bits(state.current_zoom.load(Ordering::Acquire));
 
-                    if !data_ptr.is_null() && data_len > 0 {
-                        let meta = state
-                            .latest_metadata
-                            .read()
-                            .map(|m| *m)
-                            .unwrap_or_else(|_| Zeroable::zeroed());
-                        let cfa = state.cfa_pattern.load(Ordering::Relaxed);
-                        let assist = state.preview_assist.load(Ordering::Relaxed);
-                        let ev_gain = 2.0_f32.powf(meta.exposure_comp_ev);
-                        let lut = build_12bit_log_lut(2, ev_gain);
+                    let dump_fd = state.raw_dump_fd.load(Ordering::Relaxed);
+                    if dump_fd >= 0 {
+                        let raw_slice = std::slice::from_raw_parts(data_ptr, data_len as usize);
+                        let packed = pack_raw16_to_lossless_12bit(raw_slice, w as usize, h as usize, row_stride as usize);
+                        let mut file = std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(dump_fd));
+                        let mut hdr = [0u8; 24];
+                        hdr[0..4].copy_from_slice(b"RAWZ");
+                        hdr[4..8].copy_from_slice(&(w as u32).to_le_bytes());
+                        hdr[8..12].copy_from_slice(&(h as u32).to_le_bytes());
+                        hdr[12..16].copy_from_slice(&(packed.len() as u32).to_le_bytes());
+                        hdr[16..20].copy_from_slice(&meta.white_level.to_le_bytes());
+                        hdr[20..24].copy_from_slice(&(cfa as u32).to_le_bytes());
+                        let _ = file.write_all(&hdr);
+                        let _ = file.write_all(&packed);
+                    }
 
-                        let current_z = state
-                            .zoom_servo
-                            .lock()
-                            .map(|mut s| s.step().0)
-                            .unwrap_or(1.0);
-
-                        let dump_fd = state.raw_dump_fd.load(Ordering::Relaxed);
-                        if dump_fd >= 0 {
-                            let raw_slice =
-                                std::slice::from_raw_parts(data_ptr, data_len as usize);
-                            let packed = pack_raw16_to_lossless_12bit(
-                                raw_slice,
-                                w as usize,
-                                h as usize,
-                                row_stride as usize,
-                            );
-
-                            let mut file = std::mem::ManuallyDrop::new(
-                                std::fs::File::from_raw_fd(dump_fd),
-                            );
-                            let mut hdr = [0u8; 24];
-                            hdr[0..4].copy_from_slice(b"RAWZ");
-                            hdr[4..8].copy_from_slice(&(w as u32).to_le_bytes());
-                            hdr[8..12].copy_from_slice(&(h as u32).to_le_bytes());
-                            hdr[12..16].copy_from_slice(&(packed.len() as u32).to_le_bytes());
-                            hdr[16..20].copy_from_slice(&meta.white_level.to_le_bytes());
-                            hdr[20..24].copy_from_slice(&(cfa as u32).to_le_bytes());
-                            let _ = file.write_all(&hdr);
-                            let _ = file.write_all(&packed);
+                    let mut hist_local = [0.0f32; 64];
+                    if let Ok(pw_guard) = state.preview_window.lock() {
+                        if let Some(ref win) = *pw_guard {
+                            blit_raw16_to_window(win.0, data_ptr, w, h, row_stride, &meta, cfa, &lut, assist, current_z, Some(&mut hist_local));
                         }
+                    }
+                    if let Ok(mut h_lock) = state.latest_histogram.lock() { *h_lock = hist_local; }
 
-                        let mut hist_local = [0.0f32; 64];
-                        if let Ok(pw_guard) = state.preview_window.lock() {
-                            if let Some(ref win) = *pw_guard {
-                                blit_raw16_to_window(
-                                    win.0,
-                                    data_ptr,
-                                    w,
-                                    h,
-                                    row_stride,
-                                    &meta,
-                                    cfa,
-                                    &lut,
-                                    assist,
-                                    current_z,
-                                    Some(&mut hist_local),
-                                );
-                            }
-                        }
-                        if let Ok(mut h_lock) = state.latest_histogram.lock() {
-                            *h_lock = hist_local;
-                        }
-
-                        if let Ok(rw_guard) = state.record_window.lock() {
-                            if let Some(ref win) = *rw_guard {
-                                blit_raw16_to_window(
-                                    win.0,
-                                    data_ptr,
-                                    w,
-                                    h,
-                                    row_stride,
-                                    &meta,
-                                    cfa,
-                                    &lut,
-                                    0,
-                                    current_z,
-                                    None,
-                                );
-                            }
+                    if let Ok(rw_guard) = state.record_window.lock() {
+                        if let Some(ref win) = *rw_guard {
+                            blit_raw16_to_window(win.0, data_ptr, w, h, row_stride, &meta, cfa, &lut, 0, current_z, None);
                         }
                     }
                 }
             }
-        }))
-        .expect("Failed to set native RAW16 listener");
+        }
+    })).expect("Failed to set native RAW16 listener");
 
     let window = reader.window().expect("Failed to get RAW16 ANativeWindow");
-    let surface_obj = unsafe {
-        ndk_sys::ANativeWindow_toSurface(env.get_native_interface(), window.ptr().as_ptr())
-    };
-
+    let surface_obj = unsafe { ndk_sys::ANativeWindow_toSurface(env.get_native_interface(), window.ptr().as_ptr()) };
     std::mem::forget(reader);
     surface_obj
 }

@@ -1,5 +1,10 @@
-use ash::vk;
-use bytemuck::{Pod, Zeroable};
+// File: lib.rs
+// Path: app/src/main/rust/src/lib.rs
+mod zoom;
+mod color_science;
+mod raw_codec;
+mod vulkan;
+
 use jni::{
     objects::{JClass, JFloatArray, JObject, JString},
     sys::{jboolean, jfloat, jfloatArray, jint, jobject},
@@ -15,234 +20,13 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex, OnceLock, RwLock,
 };
-use std::time::Instant;
 
-pub static CINEMA_SHADER_SPV: &[u8] = include_bytes!("../shaders/cinema_pipeline.spv");
+use bytemuck::Zeroable;
 
-pub unsafe fn create_cinema_shader_module(
-    device: &ash::Device,
-) -> Result<vk::ShaderModule, vk::Result> {
-    let spv_words: &[u32] = bytemuck::cast_slice(CINEMA_SHADER_SPV);
-    let create_info = vk::ShaderModuleCreateInfo::default().code(spv_words);
-    device.create_shader_module(&create_info, None)
-}
-
-pub struct SafeNativeWindow(*mut ndk_sys::ANativeWindow);
-unsafe impl Send for SafeNativeWindow {}
-unsafe impl Sync for SafeNativeWindow {}
-
-impl Drop for SafeNativeWindow {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { ndk_sys::ANativeWindow_release(self.0); }
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct FrameParamsPushConstants {
-    pub black_level: [f32; 4],
-    pub white_level: f32,
-    pub transfer_mode: i32,
-    pub preview_assist: i32,
-    pub exposure_comp_ev: f32,
-    pub wb_gains: [f32; 4],
-    pub sensor_to_rec2020_col0: [f32; 4],
-    pub sensor_to_rec2020_col1: [f32; 4],
-    pub sensor_to_rec2020_col2: [f32; 4],
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Zoom easing modes — includes a fully custom cubic-bezier variant
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-pub enum ZoomEasing {
-    Cosine,
-    EaseInOutCubic,
-    Smootherstep,
-    EaseInOutQuint,
-    CustomBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
-}
-
-impl ZoomEasing {
-    pub fn from_i32(v: i32) -> Self {
-        match v {
-            0 => Self::Cosine,
-            2 => Self::Smootherstep,
-            3 => Self::EaseInOutQuint,
-            4 => Self::CustomBezier { x1: 0.25, y1: 0.10, x2: 0.25, y2: 1.0 },
-            _ => Self::EaseInOutCubic,
-        }
-    }
-
-    #[inline(always)]
-    pub fn apply(&self, t: f64) -> f64 {
-        let t = t.clamp(0.0, 1.0);
-        match self {
-            Self::Cosine => 0.5 - 0.5 * (std::f64::consts::PI * t).cos(),
-            Self::EaseInOutCubic => {
-                if t < 0.5 {
-                    4.0 * t * t * t
-                } else {
-                    let f = -2.0 * t + 2.0;
-                    1.0 - (f * f * f) / 2.0
-                }
-            }
-            Self::Smootherstep => t * t * t * (t * (t * 6.0 - 15.0) + 10.0),
-            Self::EaseInOutQuint => {
-                if t < 0.5 {
-                    16.0 * t.powi(5)
-                } else {
-                    let f = -2.0 * t + 2.0;
-                    1.0 - f.powi(5) / 2.0
-                }
-            }
-            Self::CustomBezier { x1, y1, x2, y2 } => bezier_y_for_x(t, *x1, *y1, *x2, *y2),
-        }
-    }
-}
-
-// ── Cubic-bezier math (CSS / iOS compatible) ────────────────────────────────
-// P(t) = 3(1-t)^2 t * C1 + 3(1-t) t^2 * C2 + t^3    with P0=(0,0), P3=(1,1)
-
-#[inline(always)]
-fn bezier_coord(t: f64, c1: f64, c2: f64) -> f64 {
-    let mt = 1.0 - t;
-    3.0 * mt * mt * t * c1 + 3.0 * mt * t * t * c2 + t * t * t
-}
-
-#[inline(always)]
-fn bezier_derivative(t: f64, c1: f64, c2: f64) -> f64 {
-    let mt = 1.0 - t;
-    3.0 * mt * mt * c1 + 6.0 * mt * t * (c2 - c1) + 3.0 * t * t * (1.0 - c2)
-}
-
-/// Solve y for a given x (time) using Newton-Raphson. Fast + accurate.
-fn bezier_y_for_x(x: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
-    if x <= 0.0 { return 0.0; }
-    if x >= 1.0 { return 1.0; }
-    if (x1 - y1).abs() < 1e-9 && (x2 - y2).abs() < 1e-9 { return x; }
-
-    let mut t = x;
-    for _ in 0..12 {
-        let err = bezier_coord(t, x1, x2) - x;
-        if err.abs() < 1e-7 { break; }
-        let d = bezier_derivative(t, x1, x2);
-        if d.abs() < 1e-7 { break; }
-        t = (t - err / d).clamp(0.0, 1.0);
-    }
-    bezier_coord(t, y1, y2)
-}
-
-/// High-Precision Native Rust Cinema Power-Zoom Servo.
-/// Stepped exclusively by the dedicated `ZoomServo240Hz` thread.
-pub struct CinemaZoomServo {
-    pub start_zoom: f64,
-    pub target_zoom: f64,
-    pub current_zoom: f64,
-    pub start_instant: Instant,
-    pub duration_secs: f64,
-    pub is_animating: bool,
-    pub easing: ZoomEasing,
-
-    // ── NEW ── Duration control
-    /// If > 0, overrides the auto-computed duration entirely (seconds).
-    pub duration_override_secs: f64,
-    /// Multiplier on the auto-computed duration (only used when override == 0).
-    pub duration_scale: f64,
-}
-
-impl CinemaZoomServo {
-    pub fn new() -> Self {
-        Self {
-            start_zoom: 1.0,
-            target_zoom: 1.0,
-            current_zoom: 1.0,
-            start_instant: Instant::now(),
-            duration_secs: 0.0,
-            is_animating: false,
-            easing: ZoomEasing::EaseInOutCubic,
-            duration_override_secs: 0.0,   // 0 = auto
-            duration_scale: 1.0,           // 1.0 = default speed
-        }
-    }
-
-    pub fn set_easing(&mut self, mode: i32) {
-        self.easing = ZoomEasing::from_i32(mode);
-    }
-
-    pub fn set_custom_bezier(&mut self, x1: f64, y1: f64, x2: f64, y2: f64) {
-        self.easing = ZoomEasing::CustomBezier {
-            x1: x1.clamp(0.0, 1.0),
-            y1: y1.clamp(0.0, 1.0),
-            x2: x2.clamp(0.0, 1.0),
-            y2: y2.clamp(0.0, 1.0),
-        };
-    }
-
-    pub fn set_target(&mut self, target: f64) {
-        let clamped_target = target.clamp(0.5, 10.0);
-        if (clamped_target - self.current_zoom).abs() < 0.001 {
-            self.current_zoom = clamped_target;
-            self.target_zoom = clamped_target;
-            self.is_animating = false;
-            return;
-        }
-        self.start_zoom = self.current_zoom.clamp(0.5, 10.0);
-        self.target_zoom = clamped_target;
-
-        let octaves = (self.target_zoom / self.start_zoom).log2().abs();
-        let auto_duration = (0.30 + octaves * 0.28).clamp(0.42, 1.45);
-
-        // ── CHANGED ── Honour user override, else scale the auto value.
-        self.duration_secs = if self.duration_override_secs > 0.0 {
-            self.duration_override_secs.clamp(0.10, 5.00)
-        } else {
-            (auto_duration * self.duration_scale.clamp(0.10, 5.00)).clamp(0.10, 5.00)
-        };
-
-        self.start_instant = Instant::now();
-        self.is_animating = true;
-    }
-
-    pub fn hard_reset(&mut self, zoom: f64) {
-        let z = zoom.clamp(0.5, 10.0);
-        self.start_zoom = z;
-        self.target_zoom = z;
-        self.current_zoom = z;
-        self.duration_secs = 0.0;
-        self.is_animating = false;
-    }
-
-    pub fn snapshot(&mut self) {
-        self.start_zoom = self.current_zoom;
-        self.target_zoom = self.current_zoom;
-        self.duration_secs = 0.0;
-        self.is_animating = false;
-    }
-
-    #[inline(always)]
-    pub fn step(&mut self) -> (f32, bool) {
-        if !self.is_animating {
-            return (self.current_zoom as f32, false);
-        }
-        let elapsed = self.start_instant.elapsed().as_secs_f64();
-        let t = (elapsed / self.duration_secs).clamp(0.0, 1.0);
-
-        if t >= 1.0 {
-            self.current_zoom = self.target_zoom;
-            self.is_animating = false;
-            return (self.current_zoom as f32, false);
-        }
-
-        let eased = self.easing.apply(t);
-        // Log-space interpolation: equal octaves take equal time.
-        self.current_zoom = self.start_zoom * (self.target_zoom / self.start_zoom).powf(eased);
-        (self.current_zoom as f32, true)
-    }
-}
+use crate::zoom::{CinemaZoomServo, ZoomEasing};
+use crate::color_science::*;
+use crate::raw_codec::*;
+use crate::vulkan::{FrameParamsPushConstants, SafeNativeWindow};
 
 pub struct SharedCameraState {
     pub transfer_mode: AtomicI32,
@@ -309,114 +93,6 @@ fn get_state() -> &'static Arc<SharedCameraState> {
 
         state
     })
-}
-
-fn pack_raw16_to_lossless_12bit(raw_bytes: &[u8], w: usize, h: usize, stride_bytes: usize) -> Vec<u8> {
-    let total_pixels = w * h;
-    let mut packed = Vec::with_capacity((total_pixels * 3) / 2);
-    let src_u16 = unsafe { std::slice::from_raw_parts(raw_bytes.as_ptr() as *const u16, raw_bytes.len() / 2) };
-    let stride_u16 = stride_bytes / 2;
-    for y in 0..h {
-        let row = &src_u16[y * stride_u16 .. y * stride_u16 + w];
-        let mut x = 0;
-        while x + 1 < w {
-            let p0 = row[x] & 0x0FFF;
-            let p1 = row[x + 1] & 0x0FFF;
-            packed.push((p0 & 0xFF) as u8);
-            packed.push((((p0 >> 8) & 0x0F) | ((p1 & 0x0F) << 4)) as u8);
-            packed.push(((p1 >> 4) & 0xFF) as u8);
-            x += 2;
-        }
-    }
-    packed
-}
-
-fn unpack_lossless_12bit_to_raw16(packed: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut out_u8 = Vec::with_capacity(w * h * 2);
-    let mut i = 0;
-    while i + 2 < packed.len() {
-        let b0 = packed[i] as u16;
-        let b1 = packed[i + 1] as u16;
-        let b2 = packed[i + 2] as u16;
-        let p0: u16 = b0 | ((b1 & 0x0F) << 8);
-        let p1: u16 = (b1 >> 4) | (b2 << 4);
-        out_u8.extend_from_slice(&p0.to_le_bytes());
-        out_u8.extend_from_slice(&p1.to_le_bytes());
-        i += 3;
-    }
-    out_u8
-}
-
-#[inline(always)]
-fn linear_to_slog3(x: f32) -> f32 {
-    if x >= 0.01125000 {
-        (420.0 + ((x + 0.01).log10() - 0.19_f32.log10()) * 261.5) / 1023.0
-    } else {
-        (x * (171.2102946929 - 95.0) / 0.01125000 + 95.0) / 1023.0
-    }
-}
-
-#[inline(always)]
-fn linear_to_arri_logc4(x: f32) -> f32 {
-    let a = 2231.8263_f32;
-    let b = 0.90713587_f32;
-    let c = 0.092864125_f32;
-    let s = -0.000441625_f32;
-    let t = -0.018056996_f32;
-    if x >= t { ((a * x + 64.0).log2() - 6.0) / 14.0 * b + c } else { (x - t) / s }
-}
-
-#[inline(always)]
-fn linear_to_aces_cct(x: f32) -> f32 {
-    if x <= 0.0078125 { 10.5402377 * x + 0.072905534 } else { (x.log2() + 9.72) / 17.52 }
-}
-
-#[inline(always)]
-fn linear_to_canon_log3(x: f32) -> f32 {
-    if x < -0.014 {
-        -0.36726845 * (1.0 - 14.98325 * x).log10() + 0.12783901
-    } else if x <= 0.014 {
-        1.9754798 * x + 0.12512219
-    } else {
-        0.36726845 * (14.98325 * x + 1.0).log10() + 0.12240537
-    }
-}
-
-#[inline(always)]
-fn linear_to_apple_log(r: f32) -> f32 {
-    let r0 = -0.05641088_f32;
-    let rt = 0.01_f32;
-    let c = 47.28711236_f32;
-    let beta = 0.00964052_f32;
-    let gamma = 0.08550479_f32;
-    let delta = 0.69336945_f32;
-    if r < r0 { 0.0 }
-    else if r < rt { c * (r - r0).powi(2) }
-    else { gamma * (r + beta).log2() + delta }
-}
-
-#[inline(always)]
-fn linear_to_rec709(x: f32) -> f32 {
-    let m = (x / (x + 0.18)).clamp(0.0, 1.0);
-    m.powf(1.0 / 2.2)
-}
-
-fn build_12bit_log_lut(transfer_mode: i32, ev_gain: f32) -> [u8; 4096] {
-    let mut lut = [0u8; 4096];
-    for i in 0..4096 {
-        let x = (i as f32 / 4095.0) * ev_gain;
-        let y = match transfer_mode {
-            0 => linear_to_rec709(x),
-            1 => x.clamp(0.0, 1.0).powf(1.0 / 2.2),
-            3 => linear_to_arri_logc4(x),
-            4 => linear_to_aces_cct(x),
-            5 => linear_to_canon_log3(x),
-            6 => linear_to_apple_log(x),
-            _ => linear_to_slog3(x),
-        };
-        lut[i] = (y.clamp(0.0, 1.0) * 255.0) as u8;
-    }
-    lut
 }
 
 #[inline(always)]
@@ -562,100 +238,19 @@ unsafe fn blit_raw16_to_window(
     }
 }
 
-fn write_cinema_dng_frame(
-    out_path: &str, w: u32, h: u32, stride: u32,
-    white_level: f32, cfa: i32, raw_bytes: &[u8],
-) -> std::io::Result<()> {
-    let mut f = File::create(out_path)?;
-    let cfa_bytes: [u8; 4] = match cfa {
-        1 => [1, 0, 2, 1],
-        2 => [1, 2, 0, 1],
-        3 => [2, 1, 1, 0],
-        _ => [0, 1, 1, 2],
-    };
-    let num_entries: u16 = 16;
-    let ifd_offset: u32 = 8;
-    let pixel_data_offset: u32 = 256;
-    let strip_byte_count: u32 = w * h * 2;
-
-    let mut hdr = Vec::with_capacity(pixel_data_offset as usize);
-    hdr.extend_from_slice(b"II");
-    hdr.extend_from_slice(&42u16.to_le_bytes());
-    hdr.extend_from_slice(&ifd_offset.to_le_bytes());
-    hdr.extend_from_slice(&num_entries.to_le_bytes());
-
-    let push_tag = |buf: &mut Vec<u8>, tag: u16, typ: u16, count: u32, val_or_offset: u32| {
-        buf.extend_from_slice(&tag.to_le_bytes());
-        buf.extend_from_slice(&typ.to_le_bytes());
-        buf.extend_from_slice(&count.to_le_bytes());
-        buf.extend_from_slice(&val_or_offset.to_le_bytes());
-    };
-
-    push_tag(&mut hdr, 0x00FE, 4, 1, 0);
-    push_tag(&mut hdr, 0x0100, 4, 1, w);
-    push_tag(&mut hdr, 0x0101, 4, 1, h);
-    push_tag(&mut hdr, 0x0102, 3, 1, 16);
-    push_tag(&mut hdr, 0x0103, 3, 1, 1);
-    push_tag(&mut hdr, 0x0106, 3, 1, 32803);
-    push_tag(&mut hdr, 0x0111, 4, 1, pixel_data_offset);
-    push_tag(&mut hdr, 0x0112, 3, 1, 1);
-    push_tag(&mut hdr, 0x0115, 3, 1, 1);
-    push_tag(&mut hdr, 0x0116, 4, 1, h);
-    push_tag(&mut hdr, 0x0117, 4, 1, strip_byte_count);
-    push_tag(&mut hdr, 0x828D, 3, 2, 0x0002_0002);
-    push_tag(&mut hdr, 0x828E, 1, 4, u32::from_le_bytes(cfa_bytes));
-    push_tag(&mut hdr, 0xC612, 1, 4, u32::from_le_bytes([1, 4, 0, 0]));
-    push_tag(&mut hdr, 0xC61A, 4, 1, 64);
-    push_tag(&mut hdr, 0xC61D, 4, 1, (white_level as u32).max(1023));
-
-    hdr.extend_from_slice(&0u32.to_le_bytes());
-    hdr.resize(pixel_data_offset as usize, 0u8);
-    f.write_all(&hdr)?;
-
-    let row_bytes = (w * 2) as usize;
-    let stride_usize = stride as usize;
-    if stride_usize == row_bytes && raw_bytes.len() >= (h as usize) * row_bytes {
-        f.write_all(&raw_bytes[0..(h as usize) * row_bytes])?;
-    } else {
-        for y in 0..(h as usize) {
-            let start = y * stride_usize;
-            let end = start + row_bytes;
-            if end <= raw_bytes.len() { f.write_all(&raw_bytes[start..end])?; }
-        }
-    }
-    Ok(())
-}
-
-fn read_raw_frame_payload(
-    file: &mut File, hdr: &[u8; 24],
-    w: usize, h: usize, stride_or_packed_len: usize,
-) -> std::io::Result<(Vec<u8>, i32)> {
-    if &hdr[0..4] == b"RAWZ" {
-        let mut packed = vec![0u8; stride_or_packed_len];
-        file.read_exact(&mut packed)?;
-        let unpacked = unpack_lossless_12bit_to_raw16(&packed, w, h);
-        Ok((unpacked, (w * 2) as i32))
-    } else {
-        let payload_size = h * stride_or_packed_len;
-        let mut raw_buf = vec![0u8; payload_size];
-        file.read_exact(&mut raw_buf)?;
-        Ok((raw_buf, stride_or_packed_len as i32))
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // JNI entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_initEngine(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_initEngine(
     _env: JNIEnv, _class: JClass,
 ) {
     let _ = get_state();
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomTarget(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setZoomTarget(
     _env: JNIEnv, _class: JClass, target_zoom: jfloat,
 ) {
     let state = get_state();
@@ -666,9 +261,8 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
     }
 }
 
-/// Set a fixed duration (seconds). Pass <= 0 to restore auto-duration.
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomDurationFixed(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setZoomDurationFixed(
     _env: JNIEnv, _class: JClass, seconds: jfloat,
 ) {
     if let Ok(mut servo) = get_state().zoom_servo.lock() {
@@ -680,9 +274,8 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
     }
 }
 
-/// Returns the currently-set fixed duration, or 0.0 if in auto mode.
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getZoomDurationFixed(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_getZoomDurationFixed(
     _env: JNIEnv, _class: JClass,
 ) -> jfloat {
     get_state().zoom_servo.lock()
@@ -690,10 +283,8 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
         .unwrap_or(0.0)
 }
 
-/// Multiplier on the auto-computed duration. 0.5 = twice as fast, 2.0 = twice as slow.
-/// Ignored when a fixed duration is set.
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomDurationScale(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setZoomDurationScale(
     _env: JNIEnv, _class: JClass, scale: jfloat,
 ) {
     if let Ok(mut servo) = get_state().zoom_servo.lock() {
@@ -702,7 +293,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getZoomDurationScale(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_getZoomDurationScale(
     _env: JNIEnv, _class: JClass,
 ) -> jfloat {
     get_state().zoom_servo.lock()
@@ -711,21 +302,21 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getCurrentZoom(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_getCurrentZoom(
     _env: JNIEnv, _class: JClass,
 ) -> jfloat {
     f32::from_bits(get_state().current_zoom.load(Ordering::Acquire))
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_isZoomAnimating(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_isZoomAnimating(
     _env: JNIEnv, _class: JClass,
 ) -> jboolean {
     get_state().zoom_animating.load(Ordering::Acquire) as jboolean
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_resetZoomTo(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_resetZoomTo(
     _env: JNIEnv, _class: JClass, zoom: jfloat,
 ) {
     let state = get_state();
@@ -737,7 +328,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_snapshotZoom(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_snapshotZoom(
     _env: JNIEnv, _class: JClass,
 ) {
     let state = get_state();
@@ -749,7 +340,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setZoomEasing(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setZoomEasing(
     _env: JNIEnv, _class: JClass, mode: i32,
 ) {
     if let Ok(mut servo) = get_state().zoom_servo.lock() {
@@ -757,10 +348,8 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
     }
 }
 
-/// Apply a custom cubic-bezier (x1, y1, x2, y2). Also switches the servo to
-/// CustomBezier mode. All values must be within [0, 1] — they're clamped here too.
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setCustomBezierEasing(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setCustomBezierEasing(
     _env: JNIEnv, _class: JClass,
     x1: jfloat, y1: jfloat, x2: jfloat, y2: jfloat,
 ) {
@@ -769,10 +358,8 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
     }
 }
 
-/// Returns the currently applied bezier as [x1, y1, x2, y2]. If the servo is
-/// not in CustomBezier mode, returns the CSS-default ease-in-out curve.
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getCustomBezierEasing(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_getCustomBezierEasing(
     env: JNIEnv, _class: JClass,
 ) -> jfloatArray {
     let (x1, y1, x2, y2) = match get_state().zoom_servo.lock() {
@@ -789,7 +376,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setCameraMode(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setCameraMode(
     _env: JNIEnv, _class: JClass, transfer_mode: i32, preview_assist: i32,
 ) {
     let state = get_state();
@@ -798,14 +385,14 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setRawDumpFd(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setRawDumpFd(
     _env: JNIEnv, _class: JClass, fd: i32,
 ) {
     get_state().raw_dump_fd.store(fd, Ordering::SeqCst);
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getLiveHistogram(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_getLiveHistogram(
     env: JNIEnv, _class: JClass,
 ) -> jfloatArray {
     let state = get_state();
@@ -816,7 +403,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_getRaw16FrameCount(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_getRaw16FrameCount(
     mut env: JNIEnv, _class: JClass, file_path: JString,
 ) -> jint {
     let path_str: String = match env.get_string(&file_path) { Ok(s) => s.into(), Err(_) => return 0 };
@@ -833,7 +420,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_renderRaw16FrameFromFile(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_renderRaw16FrameFromFile(
     mut env: JNIEnv, _class: JClass,
     file_path: JString, frame_index: jint,
     transfer_mode: jint, preview_assist: jint, exposure_ev: f32, surface: JObject,
@@ -877,7 +464,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_exportRaw16ToCinemaDng(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_exportRaw16ToCinemaDng(
     mut env: JNIEnv, _class: JClass, raw16_path: JString, out_dir_path: JString,
 ) -> jint {
     let in_path: String = match env.get_string(&raw16_path) { Ok(s) => s.into(), Err(_) => return -1 };
@@ -907,7 +494,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_generateLogCurve(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_generateLogCurve(
     env: JNIEnv, _class: JClass, transfer_mode: i32, exposure_ev: f32,
 ) -> jfloatArray {
     let points = 64usize;
@@ -934,7 +521,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_updateSensorMetadata(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_updateSensorMetadata(
     env: JNIEnv, _class: JClass,
     black_level_arr: JFloatArray, white_level: f32,
     wb_gains_arr: JFloatArray, ccm_arr: JFloatArray,
@@ -960,7 +547,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_setRawOutputSurfaces(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_setRawOutputSurfaces(
     env: JNIEnv, _class: JClass, preview_surface: JObject, record_surface: JObject,
 ) {
     let state = get_state();
@@ -981,7 +568,7 @@ pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_NativeVulkanEngine_createRawSensorSurface(
+pub extern "system" fn Java_io_github_shreyasskdev_pixelcinemalog_camera_NativeVulkanEngine_createRawSensorSurface(
     env: JNIEnv, _class: JClass, width: i32, height: i32,
 ) -> jobject {
     let state = get_state().clone();

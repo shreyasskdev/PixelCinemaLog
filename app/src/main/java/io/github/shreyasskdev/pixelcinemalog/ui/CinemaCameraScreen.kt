@@ -6,6 +6,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
+import android.media.MediaActionSound
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Bundle
@@ -79,6 +80,13 @@ import io.github.shreyasskdev.pixelcinemalog.ui.components.*
 @Composable
 fun CinemaCameraScreen() {
     val context = LocalContext.current
+    val mediaSound = remember {
+        MediaActionSound().apply {
+            load(MediaActionSound.START_VIDEO_RECORDING)
+            load(MediaActionSound.STOP_VIDEO_RECORDING)
+        }
+    }
+    
     var hasCameraPerm by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
                 PackageManager.PERMISSION_GRANTED)
@@ -731,18 +739,26 @@ fun CinemaCameraScreen() {
                             fontWeight = FontWeight.ExtraBold, fontSize = 13.sp)
                     }
                     Box(
-                        modifier = Modifier.size(76.dp).clip(CircleShape)
-                            .border(3.5.dp, Color.White, CircleShape).padding(7.dp)
-                            .clip(if (isRecording) RoundedCornerShape(16.dp) else CircleShape)
+                        modifier = Modifier.size(width = 110.dp, height = 64.dp)
+                            .clip(RoundedCornerShape(50))
+                            .border(3.5.dp, Color.White, RoundedCornerShape(50))
+                            .padding(6.dp)
+                            .clip(RoundedCornerShape(50))
                             .background(HyperRed)
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
-                            ) { controller.toggleRecording(context) { isRecording = it } },
+                            ) {
+                                mediaSound.play(
+                                    if (isRecording) MediaActionSound.STOP_VIDEO_RECORDING
+                                    else MediaActionSound.START_VIDEO_RECORDING
+                                )
+                                controller.toggleRecording(context) { isRecording = it }
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         if (isRecording) Box(
-                            Modifier.size(24.dp).clip(RoundedCornerShape(6.dp)).background(Color.White)
+                            Modifier.size(22.dp).clip(RoundedCornerShape(4.dp)).background(Color.White)
                         )
                     }
                     Column(

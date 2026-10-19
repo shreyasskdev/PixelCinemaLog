@@ -24,7 +24,7 @@ import androidx.compose.ui.unit.sp
 import io.github.shreyasskdev.pixelcinemalog.camera.NativeVulkanEngine
 import kotlinx.coroutines.delay
 
-val HyperGold = Color(0xFFFFB300)
+val HyperGold = Color(0xFFFF2E2E) // Changed to Leica Red accent
 val HyperRed = Color(0xFFFF2E2E)
 val HyperBlack = Color(0xFF08080A)
 val HyperSurface = Color(0xFF141519)

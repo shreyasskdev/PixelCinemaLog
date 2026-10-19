@@ -37,6 +37,3 @@ A professional cinema camera application for Android, built with Jetpack Compose
    ```bash
    ./gradlew assembleDebug
    ```
-
-## License
-MIT License
